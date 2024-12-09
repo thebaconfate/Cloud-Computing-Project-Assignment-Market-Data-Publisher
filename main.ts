@@ -1,8 +1,8 @@
-import Fastify from "fastify";
-import http from "http";
+import fastify from "fastify";
+import fastifyIO from "fastify-socket.io";
 import mysql from "mysql2/promise";
 import { Subject } from "rxjs";
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 
 const dbCredentials = {
   host: process.env.DB_HOST,
@@ -38,8 +38,12 @@ interface Order {
 
 interface Execution extends Order {}
 
-interface StoredOrder extends Order {
-  filled: boolean;
+interface StoredOrder {
+  secnum: number;
+  quantity: number;
+  price: number;
+  side: string;
+  filledQuantity: number;
 }
 
 interface Avg {
@@ -66,21 +70,10 @@ class Event implements Execution, Order {
   }
 }
 
-const fastify = Fastify();
-const server = http.createServer(fastify.server);
-const io = new Server(server);
+const server = fastify();
+server.register(fastifyIO);
 const pool = mysql.createPool(dbCredentials);
 const eventFeeder = new Subject<Event>();
-eventFeeder.subscribe((event) => {
-  switch (event.type) {
-    case EventType.ORDER:
-      io.to(event.symbol).emit("order", event);
-      break;
-    case EventType.EXECUTION:
-      io.to(event.symbol).emit("execution", event);
-      break;
-  }
-});
 
 async function getAveragePrice(symbol: string) {
   const query =
@@ -105,65 +98,87 @@ async function getOrderBook(symbol: string) {
     "SELECT " +
     [
       "orders.secnum",
-      "orders.symbol",
       "orders.side",
       "orders.price",
       "orders.quantity",
-      "COALESCE(SUM(executions.quantity),0) as filled",
+      "COALESCE(SUM(executions.quantity),0) as filledQuantity",
     ].join(", ") +
     " " +
-    "FROM orders LEFT JOIN executions WHERE orders.filled = FALSE GROUP BY orders.id " +
+    "FROM orders LEFT JOIN executions WHERE orders.filled = FALSE GROUP BY orders.secnum " +
     "WHERE orders.symbol = ?";
   return pool
     .execute(query, [symbol])
     .then((rows) => rows[0] as unknown as StoredOrder[]);
 }
 
-fastify.post("/order", async (request, replyTo) => {
+server.post("/order", async (request, replyTo) => {
   const order = request.body as unknown as Order;
   eventFeeder.next(new Event(order, EventType.ORDER));
-  replyTo.status(200).send();
+  replyTo.code(200).send();
 });
 
-fastify.post("/execution", async (request, replyTo) => {
+server.post("/executions", async (request, replyTo) => {
+  console.log("received executions request");
   const executions = request.body as unknown as Execution[];
-  executions
-    .reverse()
-    .forEach((execution) =>
-      eventFeeder.next(new Event(execution, EventType.EXECUTION)),
-    );
-  replyTo.status(200).send();
+  console.log(executions);
+  executions.reverse().forEach((execution) => {
+    console.log(execution);
+    eventFeeder.next(new Event(execution, EventType.EXECUTION));
+  });
+  replyTo.code(200).send();
 });
 
-io.on("connection", (socket) => {
-  socket.on("joinRoom", (room) => {
-    switch (room) {
-      case Room.MSFT:
-      case Room.AAPL:
-      case Room.AMZN:
-      case Room.GOOGL:
-        socket.join(room);
-        Promise.all([getOrderBook(room), getAveragePrice(room)])
-          .then((results) => {
-            socket.emit("joinResult", {
-              orderBook: results[0],
-              averages: results[1],
+server.get("/", async (request, replyTo) => {
+  replyTo.send("Publisher operational");
+});
+
+server.ready().then(() => {
+  server.io.on("connection", (socket: Socket) => {
+    socket.on("joinRoom", (room: string) => {
+      switch (room) {
+        case Room.MSFT:
+        case Room.AAPL:
+        case Room.AMZN:
+        case Room.GOOGL:
+          socket.join(room);
+          Promise.all([getOrderBook(room), getAveragePrice(room)])
+            .then((results) => {
+              console.log(results);
+              socket.emit("joinResult", {
+                orderBook: results[0],
+                averages: results[1],
+              });
+            })
+            .catch((e: any) => {
+              console.error(e);
             });
-          })
-          .catch((e: any) => {
-            console.error(e);
-          });
+          break;
+        default:
+          break;
+      }
+    });
+    socket.on("leaveRoom", (room: string) => {
+      socket.leave(room);
+    });
+  });
+  eventFeeder.subscribe((event) => {
+    switch (event.type) {
+      case EventType.ORDER:
+        server.io.to(event.symbol).emit("order", event);
         break;
-      default:
+      case EventType.EXECUTION:
+        server.io.to(event.symbol).emit("execution", event);
         break;
     }
-  });
-
-  socket.on("leaveRoom", (room) => {
-    socket.leave(room);
   });
 });
 
 server.listen({ port: 3000, host: "0.0.0.0" }, () => {
   console.log(`Server listening on port: 3000 `);
 });
+
+declare module "fastify" {
+  interface FastifyInstance {
+    io: Server;
+  }
+}
