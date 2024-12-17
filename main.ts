@@ -84,7 +84,6 @@ server.register(fastifyIO, {
 });
 const pool = mysql.createPool(dbCredentials);
 const eventProcessor = new Subject<SimpleOrder | SimpleExecution[]>();
-const dataFeeder = new Subject<QuantityPerPriceAndSide[]>();
 
 async function getAveragePrice(symbol: string) {
   const nowExact = new Date();
@@ -100,14 +99,15 @@ async function getAveragePrice(symbol: string) {
     "SELECT " +
     [
       "orders.side",
-      "DATE_FORMAT(orders.timestamp, 'Y%-%m-%d %H:%i) AS interval",
-      "AVG(orders.price) as price",
+      "DATE_FORMAT(orders.timestamp, '%Y-%m-%d %H:%i') AS `interval`",
+      "AVG(orders.price) AS price",
     ].join(", ") +
     " " +
     "FROM orders " +
-    "WHERE orders.symbol = ? AND interval < ? " +
-    "GROUP BY orders.interval, orders.side " +
-    "ORDER BY orders.interval, orders.side";
+    "WHERE orders.symbol = ? AND orders.timestamp < ? " +
+    "GROUP BY `interval`, orders.side " +
+    "ORDER BY `interval`, orders.side";
+  // There have to be backticks around interval because it's a reserved keyword
   return pool
     .execute(query, [symbol, now.toISOString().slice(0, 19).replace("T", " ")])
     .then((rows) => rows[0] as unknown as Avg[]);
@@ -244,9 +244,12 @@ server.ready().then(() => {
               console.error(e);
             });
           getAveragePrice(room)
-            .then(([results]) => {
+            .then((results) => {
               console.log(results);
-              socket.emit("avgPricePerMin", results);
+              socket.emit("avgPricePerMin", {
+                asks: results.filter((r) => r.side === "ask"),
+                bids: results.filter((r) => r.side === "bid"),
+              });
             })
             .catch((e: any) => {
               console.error(e);
@@ -264,40 +267,9 @@ server.ready().then(() => {
   eventProcessor.subscribe((event) => {
     if (Array.isArray(event)) {
       const room = event[0].symbol;
-      /* getOrderBook(room)
-        .then((results) =>
-          server.io.to(room).emit("orderBook", {
-            asks: results
-              .filter((e) => e.side === "ask")
-              .map((e) => {
-                return {
-                  ...e,
-                  quantity: Number(e.quantity),
-                  price: Number(e.price),
-                };
-              }),
-            bids: results
-              .filter((r) => r.side === "bid")
-              .map((e) => {
-                return {
-                  ...e,
-                  quantity: Number(e.quantity),
-                  price: Number(e.price),
-                };
-              }),
-          }),
-        )
-        .catch((e: any) => {
-          console.error(e); });*/
       const askEvents = event.filter((e) => e.side === "ask");
       const bidEvents = event.filter((e) => e.side === "bid");
       getQuantitiesPerPrice(askEvents, bidEvents).then(([asks, bids]) => {
-        if (room === "AAPL") {
-          console.log("askEvents");
-          console.log(askEvents);
-          console.log("bidEvents");
-          console.log(bidEvents);
-        }
         const castedAsks = asks.map((ask) => {
           return {
             ...ask,
@@ -320,12 +292,6 @@ server.ready().then(() => {
           if (!castedBids.find((castedBid) => castedBid.price === bid.price))
             castedBids.push({ ...bid, quantity: 0 });
         });
-        if (room === "AAPL") {
-          console.log("asks");
-          console.log(castedAsks);
-          console.log("bids");
-          console.log(castedBids);
-        }
         server.io.to(room).emit("updates", {
           asks: castedAsks,
           bids: castedBids,
