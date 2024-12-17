@@ -63,8 +63,8 @@ class SimpleExecution {
 }
 
 interface QuantityPerPriceAndSide {
-  quantity: number;
-  price: number;
+  quantity: string;
+  price: string;
   side: string;
 }
 
@@ -87,23 +87,29 @@ const eventProcessor = new Subject<SimpleOrder | SimpleExecution[]>();
 const dataFeeder = new Subject<QuantityPerPriceAndSide[]>();
 
 async function getAveragePrice(symbol: string) {
-  const now = new Date();
+  const nowExact = new Date();
+  const now = new Date(
+    nowExact.getFullYear(),
+    nowExact.getMonth(),
+    nowExact.getDate(),
+    nowExact.getHours(),
+    nowExact.getMinutes(),
+  );
+
   const query =
     "SELECT " +
     [
       "orders.side",
       "DATE_FORMAT(orders.timestamp, 'Y%-%m-%d %H:%i) AS interval",
-      "SUM(orders.price * orders.quantity) / SUM(orders.quantity) as average",
+      "AVG(orders.price) as price",
     ].join(", ") +
     " " +
     "FROM orders " +
-    "WHERE orders.symbol = ? " +
+    "WHERE orders.symbol = ? AND interval < ? " +
     "GROUP BY orders.interval, orders.side " +
     "ORDER BY orders.interval, orders.side";
-  const query2 =
-    "SELECT * FROM orders WHERE orders.symbol = ? ORDER BY orders.timestamp ASC";
   return pool
-    .execute(query2, [symbol])
+    .execute(query, [symbol, now.toISOString().slice(0, 19).replace("T", " ")])
     .then((rows) => rows[0] as unknown as Avg[]);
 }
 
@@ -111,14 +117,18 @@ async function getOrderBook(symbol: string) {
   const asksQuery =
     "SELECT " +
     [
+      "orders.filled",
       "orders.side",
       "orders.price",
+      "orders.symbol",
+      "orders.secnum",
       "SUM(orders.quantity) - COALESCE(SUM(executions.quantity), 0) AS quantity",
     ].join(", ") +
     " " +
-    "FROM orders LEFT JOIN executions ON orders.secnum = executions.secnum " +
+    "FROM orders LEFT JOIN executions ON " +
+    "orders.secnum = executions.secnum " +
     "WHERE orders.filled = FALSE AND orders.symbol = ? " +
-    "GROUP BY orders.price, orders.side " +
+    "GROUP BY orders.price, orders.side, orders.filled, orders.symbol, orders.secnum " +
     "ORDER BY " +
     "CASE " +
     "WHEN orders.side = 'ask' THEN 2 " +
@@ -135,31 +145,27 @@ async function getQuantitiesPerPrice(
   asks: SimpleExecution[],
   bids: SimpleExecution[],
 ) {
-  const createQuery = (
-    sort: "DESC" | "ASC",
-    side: "bid" | "ask",
-    params: string[],
-  ) =>
+  const createQuery = (side: "bid" | "ask", params: string[]) =>
     "SELECT " +
     [
       "orders.side",
       "orders.price",
-      "SUM(orders.quantity) - COALESCE(SUM(executions.quantity), 0) AS quantity",
+      "orders.symbol",
+      "orders.quantity - COALESCE(SUM(executions.quantity), 0) AS quantity",
     ].join(", ") +
     " " +
     "FROM orders LEFT JOIN executions ON orders.secnum = executions.secnum " +
-    "WHERE orders.filled = FALSE AND orders.symbol = ? AND orders.price " +
+    "WHERE orders.filled = FALSE AND orders.symbol = ? " +
+    "AND orders.price " +
     `IN (${params.join(", ")}) ` +
     `AND orders.side = '${side}' ` +
-    "GROUP BY orders.price, orders.side " +
-    `ORDER BY orders.price ${sort}`;
+    "GROUP BY orders.secnum, orders.price, orders.side, orders.filled, orders.symbol " +
+    `ORDER BY orders.price ASC`;
   const bidQuery = createQuery(
-    "DESC",
     "bid",
     bids.map((_) => "?"),
   );
   const askQuery = createQuery(
-    "ASC",
     "ask",
     asks.map((_) => "?"),
   );
@@ -170,27 +176,6 @@ async function getQuantitiesPerPrice(
     pool
       .execute(bidQuery, [bids[0].symbol, ...bids.map((e) => e.price)])
       .then((rows) => rows[0] as unknown as QuantityPerPriceAndSide[]),
-  ]);
-}
-
-async function getQuantityPerPrice(order: SimpleOrder) {
-  const createQuery = (sort: "DESC" | "ASC") =>
-    "SELECT " +
-    [
-      "orders.side",
-      "orders.price",
-      "SUM(orders.quantity) - COALESCE(SUM(executions.quantity), 0) AS quantity",
-    ].join(", ") +
-    " " +
-    "FROM orders LEFT JOIN executions ON orders.secnum = executions.secnum " +
-    "WHERE orders.filled = FALSE AND orders.symbol = ? AND orders.price = ? " +
-    "AND orders.side = ? " +
-    "GROUP BY orders.price, orders.side " +
-    `ORDER BY orders.price ${sort}`;
-  return pool.execute(createQuery(order.side === "ask" ? "ASC" : "DESC"), [
-    order.symbol,
-    order.price,
-    order.side,
   ]);
 }
 
@@ -233,12 +218,36 @@ server.ready().then(() => {
         case Room.GOOGL:
           socket.join(room);
           getOrderBook(room)
-            .then((results) => socket.emit("orderBook", results[0]))
+            .then((results) =>
+              socket.emit("orderBook", {
+                asks: results
+                  .filter((e) => e.side === "ask")
+                  .map((e) => {
+                    return {
+                      ...e,
+                      quantity: Number(e.quantity),
+                      price: Number(e.price),
+                    };
+                  }),
+                bids: results
+                  .filter((r) => r.side === "bid")
+                  .map((e) => {
+                    return {
+                      ...e,
+                      quantity: Number(e.quantity),
+                      price: Number(e.price),
+                    };
+                  }),
+              }),
+            )
             .catch((e: any) => {
               console.error(e);
             });
           getAveragePrice(room)
-            .then((results) => socket.emit("avgPricePerMin", results[0]))
+            .then(([results]) => {
+              console.log(results);
+              socket.emit("avgPricePerMin", results);
+            })
             .catch((e: any) => {
               console.error(e);
             });
@@ -254,32 +263,80 @@ server.ready().then(() => {
   });
   eventProcessor.subscribe((event) => {
     if (Array.isArray(event)) {
-      event as SimpleExecution[];
-      const eventAsks = event.filter((e) => e.side === "ask");
-      const eventBids = event.filter((e) => e.side === "bid");
-      getQuantitiesPerPrice(eventAsks, eventBids).then(([asks, bids]) => {
-        eventAsks.forEach((eA) => {
-          if (asks.findIndex((a) => a.price === eA.price) === -1) {
-            asks.push({ price: eA.price, side: eA.side, quantity: 0 });
-          }
+      const room = event[0].symbol;
+      /* getOrderBook(room)
+        .then((results) =>
+          server.io.to(room).emit("orderBook", {
+            asks: results
+              .filter((e) => e.side === "ask")
+              .map((e) => {
+                return {
+                  ...e,
+                  quantity: Number(e.quantity),
+                  price: Number(e.price),
+                };
+              }),
+            bids: results
+              .filter((r) => r.side === "bid")
+              .map((e) => {
+                return {
+                  ...e,
+                  quantity: Number(e.quantity),
+                  price: Number(e.price),
+                };
+              }),
+          }),
+        )
+        .catch((e: any) => {
+          console.error(e); });*/
+      const askEvents = event.filter((e) => e.side === "ask");
+      const bidEvents = event.filter((e) => e.side === "bid");
+      getQuantitiesPerPrice(askEvents, bidEvents).then(([asks, bids]) => {
+        if (room === "AAPL") {
+          console.log("askEvents");
+          console.log(askEvents);
+          console.log("bidEvents");
+          console.log(bidEvents);
+        }
+        const castedAsks = asks.map((ask) => {
+          return {
+            ...ask,
+            price: Number(ask.price),
+            quantity: Number(ask.quantity),
+          };
         });
-        eventBids.forEach((eventBid) => {
-          if (bids.findIndex((b) => b.price === eventBid.price))
-            bids.push({
-              price: eventBid.price,
-              side: eventBid.side,
-              quantity: 0,
-            });
+        const castedBids = bids.map((bid) => {
+          return {
+            ...bid,
+            price: Number(bid.price),
+            quantity: Number(bid.quantity),
+          };
         });
-        server.io.to(event[0].symbol).emit("updates", {
-          asks: asks,
-          bids: bids,
+        askEvents.forEach((ask) => {
+          if (!castedAsks.find((castedAsk) => castedAsk.price === ask.price))
+            castedAsks.push({ ...ask, quantity: 0 });
+        });
+        bidEvents.forEach((bid) => {
+          if (!castedBids.find((castedBid) => castedBid.price === bid.price))
+            castedBids.push({ ...bid, quantity: 0 });
+        });
+        if (room === "AAPL") {
+          console.log("asks");
+          console.log(castedAsks);
+          console.log("bids");
+          console.log(castedBids);
+        }
+        server.io.to(room).emit("updates", {
+          asks: castedAsks,
+          bids: castedBids,
         });
       });
     } else {
-      event as SimpleOrder;
-      getQuantityPerPrice(event).then((result) => {
-        server.io.to(event.symbol).emit("update", result[0]);
+      const room = event.symbol;
+      server.io.to(room).emit("newOrder", {
+        price: event.price,
+        side: event.side,
+        quantity: event.quantity,
       });
     }
   });
