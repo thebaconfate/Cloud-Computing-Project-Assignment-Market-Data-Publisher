@@ -23,7 +23,7 @@ enum Room {
   AMZN = "AMZN",
 }
 
-interface Order {
+interface OrderInterface {
   secnum: number;
   quantity: number;
   price: number;
@@ -31,47 +31,57 @@ interface Order {
   side: "ask" | "bid";
 }
 
-class SimpleOrder {
+interface Execution {
+  asks: Order[];
+  bids: Order[];
+}
+
+class OrderWithoutSymbol {
+  secnum: number;
+  side: string;
   price: number;
   quantity: number;
-  symbol: string;
-  side: "ask" | "bid";
-  constructor(
-    quantity: number,
-    price: number,
-    symbol: string,
-    side: "ask" | "bid",
-  ) {
+  constructor(secnum: number, price: number, quantity: number, side: string) {
+    this.secnum = secnum;
+    this.price = price;
     this.quantity = quantity;
-    this.price = price;
-    this.symbol = symbol;
     this.side = side;
   }
 }
 
-interface Execution extends Order {}
-
-class SimpleExecution {
-  price: number;
-  side: "ask" | "bid";
+class Order extends OrderWithoutSymbol {
   symbol: string;
-  constructor(price: number, side: "ask" | "bid", symbol: string) {
-    this.price = price;
-    this.side = side;
+  constructor(
+    secnum: number,
+    price: number,
+    quantity: number,
+    side: string,
+    symbol: string,
+  ) {
+    super(secnum, price, quantity, side);
     this.symbol = symbol;
   }
-}
-
-interface QuantityPerPriceAndSide {
-  quantity: string;
-  price: string;
-  side: string;
 }
 
 interface Avg {
+  symbol: string;
   side: string;
   interval: Date;
-  average: number;
+  price: number;
+}
+
+interface DBAvg {
+  symbol: string;
+  side: string;
+  interval: string;
+  price: string;
+}
+
+interface DBOrder {
+  secnum: string;
+  side: string;
+  quantity: string;
+  price: string;
 }
 
 const server = fastify();
@@ -82,25 +92,33 @@ server.register(fastifyIO, {
     allowedHeaders: ["Content-Type", "Authorization"],
   },
 });
+
 const pool = mysql.createPool(dbCredentials);
-const eventProcessor = new Subject<SimpleOrder | SimpleExecution[]>();
+const eventProcessor = new Subject<Order | Execution>();
 
-async function getAveragePrice(symbol: string) {
-  const nowExact = new Date();
-  const now = new Date(
-    nowExact.getFullYear(),
-    nowExact.getMonth(),
-    nowExact.getDate(),
-    nowExact.getHours(),
-    nowExact.getMinutes(),
+function stripDate(date: Date) {
+  return new Date(
+    date.getFullYear(),
+    date.getMonth(),
+    date.getDate(),
+    date.getHours(),
+    date.getMinutes(),
   );
+}
 
+function toSQLDatetime(date: Date) {
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+async function getAveragePricesPerTimestamp(symbol: string) {
+  const nowExact = new Date();
+  const now = stripDate(nowExact);
   const query =
     "SELECT " +
     [
       "orders.side",
       "DATE_FORMAT(orders.timestamp, '%Y-%m-%d %H:%i') AS `interval`",
-      "AVG(orders.price) AS price",
+      "SUM(orders.price * orders.quantity) / SUM(orders.quantity) as price",
     ].join(", ") +
     " " +
     "FROM orders " +
@@ -109,101 +127,153 @@ async function getAveragePrice(symbol: string) {
     "ORDER BY `interval`, orders.side";
   // There have to be backticks around interval because it's a reserved keyword
   return pool
-    .execute(query, [symbol, now.toISOString().slice(0, 19).replace("T", " ")])
-    .then((rows) => rows[0] as unknown as Avg[]);
+    .execute(query, [symbol, toSQLDatetime(now)])
+    .then((rows) => rows[0] as unknown as DBAvg[])
+    .then((avgs) =>
+      avgs.map((e) => {
+        return {
+          ...e,
+          interval: new Date(e.interval.replace(" ", "T")),
+          price: Number(e.price),
+        };
+      }),
+    );
+}
+
+async function getAveragePricePerTimestamp() {
+  const nowExact = new Date();
+  const now = stripDate(nowExact);
+  const guard = new Date(now);
+  guard.setMinutes(guard.getMinutes() - 1);
+  const query =
+    "SELECT " +
+    [
+      "orders.side",
+      "orders.symbol",
+      "DATE_FORMAT(orders.timestamp, '%Y-%m-%d %H:%i') AS `interval`",
+      "SUM(orders.price * orders.quantity) / SUM(orders.quantity) as price",
+    ].join(", ") +
+    " " +
+    "FROM orders " +
+    "WHERE orders.timestamp >= ? AND orders.timestamp < ? " +
+    "GROUP BY `interval`, orders.side, orders.symbol";
+  return pool
+    .execute(query, [toSQLDatetime(guard), toSQLDatetime(now)])
+    .then(([rows]) => {
+      const castedRows = rows as unknown as DBAvg[];
+      return castedRows.map((e) => {
+        return {
+          ...e,
+          interval: new Date(e.interval.replace(" ", "T")),
+          price: Number(e.price),
+        };
+      });
+    });
 }
 
 async function getOrderBook(symbol: string) {
   const asksQuery =
     "SELECT " +
     [
-      "orders.filled",
+      "orders.secnum",
       "orders.side",
       "orders.price",
-      "orders.symbol",
-      "orders.secnum",
-      "SUM(orders.quantity) - COALESCE(SUM(executions.quantity), 0) AS quantity",
+      "orders.quantity_left AS quantity",
     ].join(", ") +
     " " +
-    "FROM orders LEFT JOIN executions ON " +
-    "orders.secnum = executions.secnum " +
-    "WHERE orders.filled = FALSE AND orders.symbol = ? " +
-    "GROUP BY orders.price, orders.side, orders.filled, orders.symbol, orders.secnum " +
+    "FROM orders " +
+    "WHERE orders.quantity_left > 0  AND orders.symbol = ? " +
     "ORDER BY " +
     "CASE " +
     "WHEN orders.side = 'ask' THEN 2 " +
     "WHEN orders.side = 'bid' THEN 1 " +
     "END, " +
-    "CASE WHEN orders.side = 'bid' THEN orders.price END DESC, " +
+    "CASE WHEN orders.side = 'bid' THEN orders.price END ASC, " +
     "CASE WHEN orders.side = 'ask' THEN orders.price END ASC";
-  return pool
-    .execute(asksQuery, [symbol])
-    .then((rows) => rows[0] as unknown as QuantityPerPriceAndSide[]);
+  return pool.execute(asksQuery, [symbol]).then(([rows]) => {
+    const result = rows as DBOrder[];
+    const castedResults = result.map(
+      (e) =>
+        new OrderWithoutSymbol(
+          Number(e.secnum),
+          Number(e.price),
+          Number(e.quantity),
+          e.side,
+        ),
+    );
+    return {
+      asks: castedResults.filter((e) => e.side === "ask"),
+      bids: castedResults.filter((e) => e.side === "bid"),
+    };
+  });
 }
 
-async function getQuantitiesPerPrice(
-  asks: SimpleExecution[],
-  bids: SimpleExecution[],
-) {
-  const createQuery = (side: "bid" | "ask", params: string[]) =>
+async function getCorrection(secnum: number) {
+  const query =
     "SELECT " +
-    [
-      "orders.side",
-      "orders.price",
-      "orders.symbol",
-      "orders.quantity - COALESCE(SUM(executions.quantity), 0) AS quantity",
-    ].join(", ") +
+    ["secnum, price, quantity_left AS quantity", "side"].join(", ") +
     " " +
-    "FROM orders LEFT JOIN executions ON orders.secnum = executions.secnum " +
-    "WHERE orders.filled = FALSE AND orders.symbol = ? " +
-    "AND orders.price " +
-    `IN (${params.join(", ")}) ` +
-    `AND orders.side = '${side}' ` +
-    "GROUP BY orders.secnum, orders.price, orders.side, orders.filled, orders.symbol " +
-    `ORDER BY orders.price ASC`;
-  const bidQuery = createQuery(
-    "bid",
-    bids.map((_) => "?"),
-  );
-  const askQuery = createQuery(
-    "ask",
-    asks.map((_) => "?"),
-  );
-  return Promise.all([
-    pool
-      .execute(askQuery, [asks[0].symbol, ...asks.map((e) => e.price)])
-      .then((rows) => rows[0] as unknown as QuantityPerPriceAndSide[]),
-    pool
-      .execute(bidQuery, [bids[0].symbol, ...bids.map((e) => e.price)])
-      .then((rows) => rows[0] as unknown as QuantityPerPriceAndSide[]),
-  ]);
+    "FROM orders " +
+    "WHERE secnum = ?";
+  return pool.execute(query, [secnum]).then(([rows]) => {
+    const result = rows as DBOrder[];
+    return result.map(
+      (e) =>
+        new OrderWithoutSymbol(
+          Number(e.secnum),
+          Number(e.price),
+          Number(e.quantity),
+          e.side,
+        ),
+    );
+  });
 }
 
-server.post("/order", async (request, replyTo) => {
-  const order = request.body as unknown as Order;
-  eventProcessor.next(
-    new SimpleOrder(order.quantity, order.price, order.symbol, order.side),
-  );
-  replyTo.code(200).send();
-});
+function computePriceEachMinute(sendToClient: (avg: Avg[]) => void) {
+  const now = new Date();
+  const delay = 60000 - (now.getSeconds() * 1000 + now.getMilliseconds());
+  setTimeout(() => {
+    setInterval(() => {
+      getAveragePricePerTimestamp().then((res) => {
+        const map = new Map<string, Avg[]>();
+        res.forEach((e) => {
+          const value = map.get(e.symbol);
+          if (value) value.push(e);
+          else map.set(e.symbol, [e]);
+        });
+        for (const value of map.values()) sendToClient(value);
+      });
+    }, 60000);
+  }, delay);
+}
 
-function handleExecutions(arr: Execution[]) {
-  if (arr.length === 0) return;
-  const symbol = arr[0].symbol;
-  const filtered = arr.filter((e) => e.symbol === symbol);
-  eventProcessor.next(
-    filtered.map((e) => new SimpleExecution(e.price, e.side, e.symbol)),
-  );
-  if (filtered.length === arr.length) return;
-  else handleExecutions(arr.filter((e) => e.symbol !== symbol));
+function handleExecutionsEvent(asks: any[], bids: any[]) {
+  server.io.to(asks[0].symbol).emit("updates", { asks: asks, bids: bids });
+}
+
+function handleNewOrderEvent(order: Order) {
+  server.io.to(order.symbol).emit("newOrder", order);
 }
 
 server.post("/executions", async (request, _) => {
-  const executions = request.body as unknown as Execution[];
-  handleExecutions(executions);
+  const executions = request.body as unknown as Execution;
+  eventProcessor.next(executions);
   return;
 });
 
+server.post("/order", async (request, _) => {
+  const order = request.body as unknown as OrderInterface;
+  eventProcessor.next(
+    new Order(
+      order.secnum,
+      order.price,
+      order.quantity,
+      order.side,
+      order.symbol,
+    ),
+  );
+  return;
+});
 server.get("/", async (_, replyTo) => {
   replyTo.send("Publisher operational");
 });
@@ -218,35 +288,11 @@ server.ready().then(() => {
         case Room.GOOGL:
           socket.join(room);
           getOrderBook(room)
-            .then((results) =>
-              socket.emit("orderBook", {
-                asks: results
-                  .filter((e) => e.side === "ask")
-                  .map((e) => {
-                    return {
-                      ...e,
-                      quantity: Number(e.quantity),
-                      price: Number(e.price),
-                    };
-                  }),
-                bids: results
-                  .filter((r) => r.side === "bid")
-                  .map((e) => {
-                    return {
-                      ...e,
-                      quantity: Number(e.quantity),
-                      price: Number(e.price),
-                    };
-                  }),
-              }),
-            )
-            .catch((e: any) => {
-              console.error(e);
-            });
-          getAveragePrice(room)
+            .then((results) => socket.emit("orderBook", results))
+            .catch((e: any) => console.error(e));
+          getAveragePricesPerTimestamp(room)
             .then((results) => {
-              console.log(results);
-              socket.emit("avgPricePerMin", {
+              socket.emit("avgPricesPerMin", {
                 asks: results.filter((r) => r.side === "ask"),
                 bids: results.filter((r) => r.side === "bid"),
               });
@@ -259,52 +305,44 @@ server.ready().then(() => {
           break;
       }
     });
+    socket.on("getOrderBook", (room: string) => {
+      getOrderBook(room)
+        .then((results) => socket.emit("orderBook", results))
+        .catch((e: any) => console.error(e));
+    });
     socket.on("leaveRoom", (room: string) => {
-      console.log(`leaveRoom ${room}`);
       socket.leave(room);
+    });
+    socket.on("getCorrection", (req: { ask: Order; bid: Order }) => {
+      Promise.all([
+        getCorrection(req.ask.secnum),
+        getCorrection(req.bid.secnum),
+      ]).then(([ask, bid]) => {
+        const handleOrder = (
+          order: OrderWithoutSymbol | undefined,
+          original: Order,
+        ) => {
+          if (!order || order.quantity === original.quantity) return;
+          else if (order.quantity === 0) socket.emit("delete", order);
+          else socket.emit("update", order);
+        };
+        handleOrder(ask[0], req.ask);
+        handleOrder(bid[0], req.bid);
+      });
     });
   });
   eventProcessor.subscribe((event) => {
-    if (Array.isArray(event)) {
-      const room = event[0].symbol;
-      const askEvents = event.filter((e) => e.side === "ask");
-      const bidEvents = event.filter((e) => e.side === "bid");
-      getQuantitiesPerPrice(askEvents, bidEvents).then(([asks, bids]) => {
-        const castedAsks = asks.map((ask) => {
-          return {
-            ...ask,
-            price: Number(ask.price),
-            quantity: Number(ask.quantity),
-          };
-        });
-        const castedBids = bids.map((bid) => {
-          return {
-            ...bid,
-            price: Number(bid.price),
-            quantity: Number(bid.quantity),
-          };
-        });
-        askEvents.forEach((ask) => {
-          if (!castedAsks.find((castedAsk) => castedAsk.price === ask.price))
-            castedAsks.push({ ...ask, quantity: 0 });
-        });
-        bidEvents.forEach((bid) => {
-          if (!castedBids.find((castedBid) => castedBid.price === bid.price))
-            castedBids.push({ ...bid, quantity: 0 });
-        });
-        server.io.to(room).emit("updates", {
-          asks: castedAsks,
-          bids: castedBids,
-        });
-      });
+    if (event instanceof Order) {
+      handleNewOrderEvent(event);
     } else {
-      const room = event.symbol;
-      server.io.to(room).emit("newOrder", {
-        price: event.price,
-        side: event.side,
-        quantity: event.quantity,
-      });
+      handleExecutionsEvent(event.asks, event.bids);
     }
+  });
+  computePriceEachMinute((avg: Avg[]) => {
+    server.io.to(avg[0].symbol).emit("avgPricePerMin", {
+      asks: avg.find((e) => e.side === "ask"),
+      bids: avg.find((e) => e.side === "bid"),
+    });
   });
 });
 
